@@ -14,7 +14,7 @@ gpack is a command-line tool to backup your coding projects to Google Drive by z
 
 ### Quick Install (Run from anywhere)
 ```bash
-npm install -g git+https://github.com/YOUR_USERNAME/gpack.git
+npm install -g git+https://github.com/mikeevans82/gpack.git
 ```
 *Note: Replace `YOUR_USERNAME` with your actual GitHub username.*
 
