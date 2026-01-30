@@ -1,0 +1,18 @@
+# Dependencies
+node_modules
+package-lock.json
+
+# Build output
+dist
+
+# Local gpack config
+.gpack
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# System
+.DS_Store
+Thumbs.db
