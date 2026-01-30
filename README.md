@@ -12,23 +12,23 @@ gpack is a command-line tool to backup your coding projects to Google Drive by z
 
 ## Installation
 
+**Prerequisites**: Node.js installed (v18+ recommended).
+
 ### Quick Install (Run from anywhere)
 ```bash
 npm install -g git+https://github.com/mikeevans82/gpack.git
 ```
-*Note: Replace `YOUR_USERNAME` with your actual GitHub username.*
 
 ### Manual Install (Development)
 
-1.  **Prerequisites**: Node.js installed (v18+ recommended).
-2.  **Clone or Download** this repository.
-3.  **Install dependencies**:
+1.  **Clone or Download** this repository.
+2.  **Install dependencies**:
     ```bash
     npm install
     # Build the project
     npm run build
     ```
-4.  **Link globally** (optional, to run `gpack` from anywhere):
+3.  **Link globally** (optional, to run `gpack` from anywhere):
     ```bash
     npm link
     ```
@@ -38,9 +38,9 @@ npm install -g git+https://github.com/mikeevans82/gpack.git
 
 To use gpack, you need your own Google Cloud Project credentials (client ID and secret) currently, or you can use provided ones if available.
 
-1.  Go to [Google Cloud Console](https://console.cloud.google.com/).
-2.  Create a new project.
-3.  Enable **Google Drive API**.
+1.  Go to [Google Cloud Resource Manager](https://console.cloud.google.com/cloud-resource-manager).
+2.  Create (or edit) a project.
+3.  Enable **Google Drive API** in that project.
 4.  Go to **Credentials** -> **Create Credentials** -> **OAuth client ID**.
 5.  Application type: **Desktop app**.
 6.  Copy the **Client ID** and **Client Secret**.
@@ -55,20 +55,6 @@ To avoid your login expiring every 7 days:
 4.  You *do not* need to submit for verification.
 5.  When you login, you will see a "Google hasn't verified this app" warning.
 6.  Click **Advanced** -> **Go to (Project Name) (unsafe)**. This is safe for your own private app.
-
-### FAQ: Why do I need a Google Cloud Project?
-
-**Q: Does every user need to create a project?**
-A: **Yes**, unless the app maintainer (you) goes through Google's "App Verification" process.
-
-**The Trade-off:**
-1.  **Bring Your Own Key (Recommended for Dev Tools):** correct way for open-source tools. Each user creates their own project. It's secure, free, and you own your data/quotas.
-2.  **Shared Credentials (Unverified):** You *could* share your `client_id` and `client_secret` with others.
-    -   **Pros:** Users don't need to setup Cloud Console.
-    -   **Cons:** Users will see a scary "Google hasn't verified this app" warning. You might hit API rate limits if many people use it.
-3.  **Verified App (Commercial/SaaS):** The maintainer submits the app to Google for a security review (can cost $15k+ annually for restricted scopes like Drive, though sometimes free for small tools). This removes the scary warnings and allows one set of credentials for everyone.
-
-**Summary:** For a free, open-source CLI tool, asking developers to "Bring Your Own Key" is the standard practice (used by tools like `rclone`) to avoid security/quota issues.
 
 ## Usage
 
