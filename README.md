@@ -44,8 +44,7 @@ To use gpack, you need your own Google Cloud Project credentials (client ID and 
 3.  Enable **Google Drive API** in that project.
 4.  Go to **Credentials** -> **Create Credentials** -> **OAuth client ID**.
 5.  Application type: **Desktop app**.
-6.  **Important:** Add `http://localhost:3000/oauth2callback` to **Authorized redirect URIs** (in the credentials settings).
-7.  Copy the **Client ID** and **Client Secret**.
+6.  Copy the **Client ID** and **Client Secret**.
 7.  Run `gpack login` and follow the prompts to enter these credentials.
 
 ### Important Note on "Production" Mode (Recommended)
