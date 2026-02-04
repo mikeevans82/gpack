@@ -13,6 +13,7 @@ const program = new Command();
 
 import { initCommand } from './commands/init.js';
 import { loginCommand } from './commands/login.js';
+import { logoutCommand } from './commands/logout.js';
 import { backupCommand, backupAction } from './commands/backup.js';
 import { listCommand } from './commands/list.js';
 import { trimCommandFixed } from './commands/trim.js';
@@ -24,17 +25,26 @@ program
 
 program.addCommand(initCommand);
 program.addCommand(loginCommand);
+program.addCommand(logoutCommand);
 program.addCommand(backupCommand);
 program.addCommand(listCommand);
 program.addCommand(trimCommandFixed);
 
 program.action(async () => {
-    // Check if user just ran `gpack` without arguments
-    // If so, trigger backup
-    // But we should check if they passed options that commander processed?
-    // Commander default action is triggered if no sub-command matches.
+    // If there are arguments but no command matched, it means unknown command 
+    // because we are in the default action handler.
+    // However, Commander's action handler on the root object is called when 
+    // no other command matches.
 
-    // We want `gpack` to just run backup.
+    // We only want to trigger backup if there are NO arguments (just `gpack`).
+    if (process.argv.length > 2) {
+        // argv[0] is node, argv[1] is script, argv[2+] are args.
+        // If args exist, user typed `gpack something`.
+        console.error(`Unknown command: ${process.argv[2]}`);
+        console.log('Run `gpack --help` for available commands.');
+        process.exit(1);
+    }
+
     await backupAction();
 });
 

@@ -27,13 +27,15 @@
     "inquirer": "^9.2.14",
     "open": "^10.0.3",
     "ora": "^8.0.1",
-    "picocolors": "^1.0.0"
+    "picocolors": "^1.0.0",
+    "server-destroy": "^1.0.1"
   },
   "devDependencies": {
     "@types/archiver": "^7.0.0",
     "@types/fs-extra": "^11.0.4",
     "@types/inquirer": "^9.0.7",
     "@types/node": "^20.11.16",
+    "@types/server-destroy": "^1.0.4",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3"
   }

@@ -4,6 +4,9 @@ import Conf from 'conf';
 import open from 'open';
 import inquirer from 'inquirer';
 import picocolors from 'picocolors';
+import http from 'http';
+import { URL } from 'url';
+import destroyer from 'server-destroy';
 
 // Scope for accessing only files created by this app
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
@@ -33,7 +36,7 @@ export async function getAuthenticatedClient(): Promise<OAuth2Client> {
     const oAuth2Client = new google.auth.OAuth2(
         clientId,
         clientSecret,
-        'urn:ietf:wg:oauth:2.0:oob'
+        'http://localhost:3000/oauth2callback'
     );
 
     const tokens = {
@@ -54,6 +57,13 @@ export async function getAuthenticatedClient(): Promise<OAuth2Client> {
 }
 
 export async function loginFlow() {
+    // Check if checks if user is already logged in
+    if (config.get('access_token')) {
+        console.log(picocolors.yellow('You are already logged in.'));
+        console.log('Run `gpack logout` if you want to switch accounts or refresh credentials.');
+        return;
+    }
+
     console.log(picocolors.bold('Google Drive Login Setup'));
     console.log('You need a Google Cloud Project with the Drive API enabled.');
     console.log('1. Go to Cloud Resource Manager: ' + picocolors.underline('https://console.cloud.google.com/cloud-resource-manager'));
@@ -92,10 +102,11 @@ export async function loginFlow() {
         config.set('clientSecret', clientSecret);
     }
 
+    // Use localhost redirect
     const oAuth2Client = new google.auth.OAuth2(
         clientId,
         clientSecret,
-        'urn:ietf:wg:oauth:2.0:oob'
+        'http://localhost:3000/oauth2callback'
     );
 
     const authUrl = oAuth2Client.generateAuthUrl({
@@ -107,13 +118,24 @@ export async function loginFlow() {
     console.log(picocolors.underline(authUrl));
     await open(authUrl);
 
-    const { code } = await inquirer.prompt([
-        {
-            type: 'input',
-            name: 'code',
-            message: 'Enter the code from that page here:',
-        },
-    ]);
+    // Create a local server to handle the callback
+    const code = await new Promise<string>((resolve, reject) => {
+        const server = http.createServer(async (req, res) => {
+            try {
+                if (req.url!.indexOf('/oauth2callback') > -1) {
+                    const qs = new URL(req.url!, 'http://localhost:3000').searchParams;
+                    res.end('Authentication successful! You can close this tab.');
+                    (server as any).destroy();
+                    resolve(qs.get('code')!);
+                }
+            } catch (e) {
+                reject(e);
+            }
+        }).listen(3000, () => {
+            // console.log('Listening on http://localhost:3000');
+        });
+        destroyer(server);
+    });
 
     const { tokens } = await oAuth2Client.getToken(code.trim());
     oAuth2Client.setCredentials(tokens);
@@ -125,6 +147,17 @@ export async function loginFlow() {
     if (tokens.expiry_date) config.set('expiry_date', tokens.expiry_date);
 
     console.log(picocolors.green('Successfully authenticated!'));
+}
+
+export function logout() {
+    config.delete('access_token');
+    config.delete('refresh_token');
+    config.delete('scope');
+    config.delete('token_type');
+    config.delete('expiry_date');
+    config.delete('clientId');
+    config.delete('clientSecret');
+    console.log(picocolors.green('Logged out successfully. Credentials removed.'));
 }
 
 export async function findDriveFolderId(drive: any, path: string): Promise<string | null> {
