@@ -8,6 +8,7 @@ const IGNORE_FILE = '.gpackignore';
 export interface ProjectConfig {
     backupFolder: string;
     projectId?: string; // Future proofing
+    accountEmail?: string; // The associated Google account email
 }
 
 export function getProjectConfigPath(): string {

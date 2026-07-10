@@ -91,115 +91,115 @@ export const trimCommand = new Command('trim')
 
 
 // Redefining the command with correct logic
+export async function trimAction(options: { auto?: string | boolean } = {}) {
+    const spinner = ora('Fetching backups...').start();
+    try {
+        const config = await loadProjectConfig();
+        if (!config) {
+            spinner.fail('Project not initialized. Run `gpack init` first.');
+            return;
+        }
+
+        const auth = await getAuthenticatedClient();
+        const drive = google.drive({ version: 'v3', auth });
+        const folderPath = config.backupFolder || `GPACK/${basename(process.cwd())}`;
+        const folderId = await findDriveFolderId(drive, folderPath);
+
+        if (!folderId) {
+            spinner.warn('No backups found.');
+            return;
+        }
+
+        const res = await drive.files.list({
+            q: `'${folderId}' in parents and trashed=false`,
+            fields: 'files(id, name, createdTime)',
+            orderBy: 'createdTime desc', // Newest first
+        });
+
+        const files = res.data.files || [];
+        spinner.stop();
+
+        if (files.length === 0) {
+            console.log(picocolors.yellow('No backups to trim.'));
+            return;
+        }
+
+        // Determine mode
+        let keepCount = 5;
+        let runAuto = false;
+
+        // if options.auto is present (true or string)
+        if (options.auto !== undefined) {
+            runAuto = true;
+            if (typeof options.auto === 'string') {
+                keepCount = parseInt(options.auto, 10);
+            } else if (options.auto === true) {
+                keepCount = 5; // default for flag
+            }
+        }
+
+        if (runAuto) {
+            if (files.length <= keepCount) {
+                console.log(picocolors.green(`Total backups (${files.length}) is within the limit (${keepCount}). No action taken.`));
+                return;
+            }
+            const toDelete = files.slice(keepCount);
+            console.log(picocolors.cyan(`Auto-trimming: Keeping latest ${keepCount}, deleting ${toDelete.length} old backups...`));
+
+            for (const file of toDelete) {
+                if (file.id) {
+                    await drive.files.delete({ fileId: file.id });
+                    console.log(picocolors.gray(`Deleted ${file.name}`));
+                }
+            }
+            console.log(picocolors.green('Trim complete.'));
+        } else {
+            // Interactive mode
+            console.log(`Found ${files.length} backups.`);
+            const choices = files.map(f => ({
+                name: `${f.name} (${f.createdTime})`,
+                value: f.id,
+                checked: false
+            }));
+
+            const answers = await inquirer.prompt([
+                {
+                    type: 'checkbox',
+                    name: 'filesToDelete',
+                    message: 'Select backups to DELETE (Space to select, Enter to confirm):',
+                    choices: choices,
+                    pageSize: 10
+                }
+            ]);
+
+            if (answers.filesToDelete.length === 0) {
+                console.log('No files deletion selected.');
+                return;
+            }
+
+            const confirm = await inquirer.prompt([{
+                type: 'confirm',
+                name: 'sure',
+                message: `Are you sure you want to delete ${answers.filesToDelete.length} backups?`,
+                default: false
+            }]);
+
+            if (confirm.sure) {
+                const spinnerDel = ora('Deleting...').start();
+                for (const id of answers.filesToDelete) {
+                    await drive.files.delete({ fileId: id });
+                }
+                spinnerDel.succeed(`Deleted ${answers.filesToDelete.length} backups.`);
+            }
+        }
+
+    } catch (error: any) {
+        spinner.fail(`Failed: ${error.message}`);
+    }
+}
+
+// Redefining the command with correct logic
 export const trimCommandFixed = new Command('trim')
     .description('Trim old backups')
     .option('--auto [keep]', 'Automatically keep the last N backups (default 5 if value omitted)')
-    .action(async (options) => {
-        const spinner = ora('Fetching backups...').start();
-        try {
-            const config = await loadProjectConfig();
-            if (!config) {
-                spinner.fail('Project not initialized. Run `gpack init` first.');
-                return;
-            }
-
-            const auth = await getAuthenticatedClient();
-            const drive = google.drive({ version: 'v3', auth });
-            const folderPath = config.backupFolder || `GPACK/${basename(process.cwd())}`;
-            const folderId = await findDriveFolderId(drive, folderPath);
-
-            if (!folderId) {
-                spinner.warn('No backups found.');
-                return;
-            }
-
-            const res = await drive.files.list({
-                q: `'${folderId}' in parents and trashed=false`,
-                fields: 'files(id, name, createdTime)',
-                orderBy: 'createdTime desc', // Newest first
-            });
-
-            const files = res.data.files || [];
-            spinner.stop();
-
-            if (files.length === 0) {
-                console.log(picocolors.yellow('No backups to trim.'));
-                return;
-            }
-
-            // Determine mode
-            let keepCount = 5;
-            let runAuto = false;
-
-            // if options.auto is present (true or string)
-            if (options.auto !== undefined) {
-                runAuto = true;
-                if (typeof options.auto === 'string') {
-                    keepCount = parseInt(options.auto, 10);
-                } else if (options.auto === true) {
-                    keepCount = 5; // default for flag
-                }
-            }
-
-            if (runAuto) {
-                if (files.length <= keepCount) {
-                    console.log(picocolors.green(`Total backups (${files.length}) is within the limit (${keepCount}). No action taken.`));
-                    return;
-                }
-                const toDelete = files.slice(keepCount);
-                console.log(picocolors.cyan(`Auto-trimming: Keeping latest ${keepCount}, deleting ${toDelete.length} old backups...`));
-
-                for (const file of toDelete) {
-                    if (file.id) {
-                        await drive.files.delete({ fileId: file.id });
-                        console.log(picocolors.gray(`Deleted ${file.name}`));
-                    }
-                }
-                console.log(picocolors.green('Trim complete.'));
-            } else {
-                // Interactive mode
-                // Show list with checkboxes?
-                // Or ask "Keep how many?"
-
-                console.log(`Found ${files.length} backups.`);
-                const choices = files.map(f => ({
-                    name: `${f.name} (${f.createdTime})`,
-                    value: f.id,
-                    checked: false
-                }));
-
-                const answers = await inquirer.prompt([
-                    {
-                        type: 'checkbox',
-                        name: 'filesToDelete',
-                        message: 'Select backups to DELETE (Space to select, Enter to confirm):',
-                        choices: choices,
-                        pageSize: 10
-                    }
-                ]);
-
-                if (answers.filesToDelete.length === 0) {
-                    console.log('No files deletion selected.');
-                    return;
-                }
-
-                const confirm = await inquirer.prompt([{
-                    type: 'confirm',
-                    name: 'sure',
-                    message: `Are you sure you want to delete ${answers.filesToDelete.length} backups?`,
-                    default: false
-                }]);
-
-                if (confirm.sure) {
-                    const spinnerDel = ora('Deleting...').start();
-                    for (const id of answers.filesToDelete) {
-                        await drive.files.delete({ fileId: id });
-                    }
-                    spinnerDel.succeed(`Deleted ${answers.filesToDelete.length} backups.`);
-                }
-            }
-
-        } catch (error: any) {
-            spinner.fail(`Failed: ${error.message}`);
-        }
-    });
+    .action(trimAction);
