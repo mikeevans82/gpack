@@ -4,12 +4,14 @@ gpack is a command-line tool to backup your coding projects to Google Drive by z
 
 ## Features/Commands
 
+- **Interactive Menu (`gpack`)**: Run `gpack` with no arguments to open an interactive dashboard showing project status, configured Google Drive destination, linked Google account, last backup time, change status, and option selections.
 - `gpack init`: Initialize a project, set storage location, and create `.gpackignore`.
-- `gpack login`: Authenticate with your Google Account.
-- `gpack logout`: Disconnect your account and remove credentials.
-- `gpack push` (or just `gpack`): Backup the current project (zip & upload).
+- `gpack login`: Authenticate with your Google Account. Supports logging into multiple accounts simultaneously and switching or linking them to specific projects.
+- `gpack logout`: Disconnect your account and remove credentials. Supports logging out of a single account or all accounts.
+- `gpack push` (or `gpack backup`): Backup the current project (zip & upload). It checks if changes occurred before creating a new backup unless overridden.
 - `gpack list`: List backups and show storage usage for the current project.
-- `gpack trim`: Reduce backup count (auto-keep last 5 or interactive).
+- `gpack trim`: Reduce backup count (auto-keep last 5, custom N, or interactive deletion).
+- `gpack load` (or `gpack restore`): List and download backups of the project from Google Drive, and restore/extract the files back into the project.
 
 ## Installation
 
@@ -60,10 +62,31 @@ To avoid your login expiring every 7 days:
 ## Usage
 
 1.  Navigate to your project folder.
-2.  Run `gpack init`.
-    - Accept default `GPACK/ProjectName` or customize.
-3.  Run `gpack login` (first time only).
-4.  Run `gpack` to backup.
+2.  Run `gpack init` to configure the Google Drive destination folder.
+3.  Run `gpack login` to log in to one or more Google Accounts. If multiple accounts are logged in, you can link the project to a specific account.
+4.  Run `gpack` with no arguments to launch the interactive menu, or run `gpack push` to perform a quick backup.
+
+## Smart Change Checking
+
+To save storage and avoid duplicate backups, `gpack` performs a validation check before zipping and uploading:
+- **For Git Projects**: Checks if any new commits have been made since the last backup date, and checks for uncommitted changes (`git status --porcelain`).
+- **For Non-Git Projects**: Recursively walks the directory (ignoring node_modules, build outputs, and config files) to check if any file's modification time is newer than the last backup.
+- **Bypassing the check**: You can override the change check and force a backup by running:
+  ```bash
+  gpack push --force
+  # or
+  gpack push -f
+  ```
+  You will also be asked if you want to force a backup if you choose the "Make a Backup" option in the interactive menu when no changes are present.
+
+## Restoring Backups
+
+To restore a backup, run:
+```bash
+gpack load
+# or select "Load / Restore a Backup" in the interactive menu
+```
+This lists your backups on Google Drive, downloads your selected zip file to a temporary location, extracts it using the native system `tar` command (preserving your file structure), and cleans up.
 
 ## Backup Naming
 
@@ -76,4 +99,4 @@ For example: `gpack_2024-01-30T14-55-00-123Z.zip`
 ## Configuration
 
 - Project config is stored in `.gpack/config.json`.
-- Ignore rules are in `.gpackignore` (syntax similar to .gitignore). Default ignores: `node_modules`, `.git`, `dist`.
+- Ignore rules are in `.gpackignore` (syntax similar to .gitignore). Default ignores: `node_modules`, `.git`, `.gpack`, `dist`, `coverage`, `.env`.

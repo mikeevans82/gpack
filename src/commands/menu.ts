@@ -3,12 +3,13 @@ import { getAuthenticatedClient, findDriveFolderId } from '../lib/drive.js';
 import { loadProjectConfig } from '../lib/config.js';
 import { google } from 'googleapis';
 import picocolors from 'picocolors';
-import { basename, join } from 'path';
+import { basename, join, dirname } from 'path';
 import ora from 'ora';
 import fs from 'fs-extra';
 import inquirer from 'inquirer';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { fileURLToPath } from 'url';
 import { backupAction } from './backup.js';
 import { trimAction } from './trim.js';
 import { loadBackupAction } from './load.js';
@@ -188,6 +189,7 @@ export async function runInteractiveMenu() {
                 { name: 'Make a Backup', value: 'backup' },
                 { name: 'Trim Old Backups', value: 'trim' },
                 { name: 'Load / Restore a Backup', value: 'load' },
+                { name: 'View README', value: 'readme' },
                 { name: 'Exit', value: 'exit' }
             ]
         }]);
@@ -214,6 +216,20 @@ export async function runInteractiveMenu() {
             await inquirer.prompt([{ type: 'input', name: 'wait', message: '\nPress Enter to continue...' }]);
         } else if (choice === 'load') {
             await loadBackupAction();
+            await inquirer.prompt([{ type: 'input', name: 'wait', message: '\nPress Enter to continue...' }]);
+        } else if (choice === 'readme') {
+            try {
+                const readmePath = join(dirname(fileURLToPath(import.meta.url)), '../../../README.md');
+                if (await fs.pathExists(readmePath)) {
+                    const content = await fs.readFile(readmePath, 'utf-8');
+                    console.clear();
+                    console.log(content);
+                } else {
+                    console.log(picocolors.red('README.md not found.'));
+                }
+            } catch (err: any) {
+                console.log(picocolors.red(`Failed to load README: ${err.message}`));
+            }
             await inquirer.prompt([{ type: 'input', name: 'wait', message: '\nPress Enter to continue...' }]);
         }
     }
