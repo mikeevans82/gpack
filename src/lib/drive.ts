@@ -7,6 +7,10 @@ import picocolors from 'picocolors';
 import http from 'http';
 import { URL } from 'url';
 import destroyer from 'server-destroy';
+import fs from 'fs-extra';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
+import { dirname } from 'path';
 
 // Scope for accessing only files created by this app
 const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
@@ -343,7 +347,7 @@ export async function findDriveFolderId(drive: any, path: string): Promise<strin
 
     for (const part of parts) {
         const res = await drive.files.list({
-            q: `mimeType='application/vnd.google-apps.folder' and name='${part}' and '${parentId}' in parents and trashed=false`,
+            q: `mimeType='application/vnd.google-apps.folder' and name='${escapeDriveQueryValue(part)}' and '${parentId}' in parents and trashed=false`,
             fields: 'files(id)',
             spaces: 'drive',
         });
@@ -363,7 +367,7 @@ export async function ensureDriveFolder(drive: any, path: string): Promise<strin
 
     for (const part of parts) {
         const res = await drive.files.list({
-            q: `mimeType='application/vnd.google-apps.folder' and name='${part}' and '${parentId}' in parents and trashed=false`,
+            q: `mimeType='application/vnd.google-apps.folder' and name='${escapeDriveQueryValue(part)}' and '${parentId}' in parents and trashed=false`,
             fields: 'files(id, name)',
             spaces: 'drive',
         });
@@ -384,4 +388,238 @@ export async function ensureDriveFolder(drive: any, path: string): Promise<strin
         }
     }
     return parentId;
+}
+
+/**
+ * Escape a value destined for a Drive query string literal. `findDriveFolderId`
+ * and `ensureDriveFolder` previously interpolated names raw, so any folder
+ * containing an apostrophe produced a malformed query.
+ */
+export function escapeDriveQueryValue(value: string): string {
+    return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+export interface DriveFile {
+    id: string;
+    name: string;
+    size?: string;
+    createdTime?: string;
+    mimeType?: string;
+}
+
+const FOLDER_MIME = 'application/vnd.google-apps.folder';
+
+/**
+ * List every non-folder file in a Drive folder, following pageToken. The
+ * previous single-shot `files.list` silently truncated at one page, which now
+ * matters because a project folder holds manifests and blobs as well as zips.
+ */
+export async function listAllFiles(drive: any, folderId: string): Promise<DriveFile[]> {
+    const out: DriveFile[] = [];
+    let pageToken: string | undefined;
+
+    do {
+        const res = await drive.files.list({
+            q: `'${escapeDriveQueryValue(folderId)}' in parents and trashed=false and mimeType != '${FOLDER_MIME}'`,
+            fields: 'nextPageToken, files(id, name, size, createdTime, mimeType)',
+            orderBy: 'createdTime desc',
+            pageSize: 1000,
+            pageToken,
+        });
+        out.push(...((res.data.files || []) as DriveFile[]));
+        pageToken = res.data.nextPageToken || undefined;
+    } while (pageToken);
+
+    return out;
+}
+
+/** Resolve a direct child folder by name, creating it when missing. */
+export async function ensureChildFolder(drive: any, parentId: string, name: string): Promise<string> {
+    const res = await drive.files.list({
+        q: `mimeType='${FOLDER_MIME}' and name='${escapeDriveQueryValue(name)}' and '${escapeDriveQueryValue(parentId)}' in parents and trashed=false`,
+        fields: 'files(id)',
+        spaces: 'drive',
+    });
+    if (res.data.files && res.data.files.length > 0) return res.data.files[0].id;
+
+    const created = await drive.files.create({
+        requestBody: { name, mimeType: FOLDER_MIME, parents: [parentId] },
+        fields: 'id',
+    });
+    return created.data.id;
+}
+
+/** Find a direct child folder by name without creating it. */
+export async function findChildFolder(drive: any, parentId: string, name: string): Promise<string | null> {
+    const res = await drive.files.list({
+        q: `mimeType='${FOLDER_MIME}' and name='${escapeDriveQueryValue(name)}' and '${escapeDriveQueryValue(parentId)}' in parents and trashed=false`,
+        fields: 'files(id)',
+        spaces: 'drive',
+    });
+    if (res.data.files && res.data.files.length > 0) return res.data.files[0].id;
+    return null;
+}
+
+/** Above this size an upload runs as a resumable session instead of one POST. */
+const RESUMABLE_THRESHOLD = 8 * 1024 * 1024;
+/** Must be a multiple of 256 KiB, as the Drive resumable protocol requires. */
+const CHUNK_SIZE = 8 * 1024 * 1024;
+const MAX_CHUNK_ATTEMPTS = 5;
+
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function headerValue(headers: any, name: string): string | undefined {
+    if (!headers) return undefined;
+    if (typeof headers.get === 'function') return headers.get(name) ?? undefined;
+    return headers[name] ?? headers[name.toLowerCase()];
+}
+
+/**
+ * Upload a local file with a resumable session, retrying individual chunks.
+ *
+ * googleapis-common hardcodes uploadType to multipart or media, so it cannot do
+ * this itself; a dropped connection partway through a multi-gigabyte blob would
+ * otherwise restart the whole transfer.
+ */
+async function resumableUpload(
+    auth: OAuth2Client,
+    opts: { name: string; parents: string[]; mimeType: string; filePath: string; size: number },
+    onProgress?: (uploaded: number, total: number) => void,
+): Promise<DriveFile> {
+    const init: any = await auth.request({
+        url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size',
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json; charset=UTF-8',
+            'X-Upload-Content-Type': opts.mimeType,
+            'X-Upload-Content-Length': String(opts.size),
+        },
+        body: JSON.stringify({ name: opts.name, parents: opts.parents, mimeType: opts.mimeType }),
+    });
+
+    const sessionUrl = headerValue(init.headers, 'location');
+    if (!sessionUrl) throw new Error('Drive did not return a resumable upload session URL.');
+
+    let offset = 0;
+    let attempts = 0;
+
+    while (offset < opts.size) {
+        const end = Math.min(offset + CHUNK_SIZE, opts.size) - 1;
+        const length = end - offset + 1;
+
+        let res: any;
+        try {
+            res = await auth.request({
+                url: sessionUrl,
+                method: 'PUT',
+                headers: {
+                    'Content-Range': `bytes ${offset}-${end}/${opts.size}`,
+                    'Content-Length': String(length),
+                },
+                body: fs.createReadStream(opts.filePath, { start: offset, end }),
+                validateStatus: () => true,
+            } as any);
+        } catch (err: any) {
+            if (++attempts >= MAX_CHUNK_ATTEMPTS) throw err;
+            await sleep(500 * 2 ** attempts);
+            offset = await queryResumeOffset(auth, sessionUrl, opts.size);
+            continue;
+        }
+
+        if (res.status === 200 || res.status === 201) {
+            onProgress?.(opts.size, opts.size);
+            return res.data as DriveFile;
+        }
+
+        if (res.status === 308) {
+            const range = headerValue(res.headers, 'range');
+            offset = range ? parseInt(String(range).split('-')[1], 10) + 1 : end + 1;
+            attempts = 0;
+            onProgress?.(offset, opts.size);
+            continue;
+        }
+
+        if (res.status === 429 || res.status >= 500) {
+            if (++attempts >= MAX_CHUNK_ATTEMPTS) {
+                throw new Error(`Resumable upload failed with status ${res.status}`);
+            }
+            await sleep(500 * 2 ** attempts);
+            offset = await queryResumeOffset(auth, sessionUrl, opts.size);
+            continue;
+        }
+
+        throw new Error(`Resumable upload failed with status ${res.status}`);
+    }
+
+    // A zero-length file completes on session initiation alone.
+    return { id: '', name: opts.name };
+}
+
+/** Ask Drive how many bytes of the session it already holds. */
+async function queryResumeOffset(auth: OAuth2Client, sessionUrl: string, size: number): Promise<number> {
+    const res: any = await auth.request({
+        url: sessionUrl,
+        method: 'PUT',
+        headers: { 'Content-Range': `bytes */${size}` },
+        validateStatus: () => true,
+    } as any);
+    if (res.status === 308) {
+        const range = headerValue(res.headers, 'range');
+        return range ? parseInt(String(range).split('-')[1], 10) + 1 : 0;
+    }
+    return 0;
+}
+
+/** Upload a local file, choosing a resumable session when it is large enough. */
+export async function uploadLocalFile(
+    drive: any,
+    auth: OAuth2Client,
+    opts: { name: string; parents: string[]; mimeType: string; filePath: string },
+    onProgress?: (uploaded: number, total: number) => void,
+): Promise<DriveFile> {
+    const stat = await fs.stat(opts.filePath);
+
+    if (stat.size >= RESUMABLE_THRESHOLD) {
+        return resumableUpload(auth, { ...opts, size: stat.size }, onProgress);
+    }
+
+    const res = await drive.files.create({
+        requestBody: { name: opts.name, parents: opts.parents, mimeType: opts.mimeType },
+        media: { mimeType: opts.mimeType, body: fs.createReadStream(opts.filePath) },
+        fields: 'id, name, size',
+    });
+    onProgress?.(stat.size, stat.size);
+    return res.data as DriveFile;
+}
+
+/** Upload an in-memory string, used for manifests. */
+export async function uploadText(
+    drive: any,
+    opts: { name: string; parents: string[]; mimeType: string; content: string },
+): Promise<DriveFile> {
+    const res = await drive.files.create({
+        requestBody: { name: opts.name, parents: opts.parents, mimeType: opts.mimeType },
+        media: { mimeType: opts.mimeType, body: Readable.from([opts.content]) },
+        fields: 'id, name, size',
+    });
+    return res.data as DriveFile;
+}
+
+/** Stream a Drive file to a local path. */
+export async function downloadToFile(drive: any, fileId: string, destPath: string): Promise<void> {
+    await fs.ensureDir(dirname(destPath));
+    const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+    await pipeline(res.data as NodeJS.ReadableStream, fs.createWriteStream(destPath));
+}
+
+/** Read a Drive file into a string, used for manifests. */
+export async function downloadText(drive: any, fileId: string): Promise<string> {
+    const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+    const chunks: Buffer[] = [];
+    for await (const chunk of res.data as NodeJS.ReadableStream) {
+        chunks.push(Buffer.from(chunk as any));
+    }
+    return Buffer.concat(chunks).toString('utf-8');
 }

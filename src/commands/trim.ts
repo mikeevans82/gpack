@@ -1,96 +1,147 @@
 import { Command } from 'commander';
-import { getAuthenticatedClient, findDriveFolderId } from '../lib/drive.js';
-import { loadProjectConfig } from '../lib/config.js';
 import { google } from 'googleapis';
 import picocolors from 'picocolors';
-import { basename } from 'path';
 import ora from 'ora';
 import inquirer from 'inquirer';
+import { getAuthenticatedClient } from '../lib/drive.js';
+import { loadProjectConfig } from '../lib/config.js';
+import type { BackupManifest } from '../lib/manifest.js';
+import {
+    BackupStore,
+    RestorePoint,
+    deleteDriveFile,
+    listBlobs,
+    listRestorePoints,
+    openStoreForRead,
+    readManifest,
+} from '../lib/backupStore.js';
+import { resolveFolderPath } from '../lib/changes.js';
+import { formatBytes } from '../lib/format.js';
 
-export const trimCommand = new Command('trim')
-    .description('Trim old backups')
-    .option('--auto [keep]', 'Automatically keep only the last N backups', '5')
-    .action(async (options) => {
-        const spinner = ora('Fetching backups...').start();
-        try {
-            const config = await loadProjectConfig();
-            if (!config) {
-                spinner.fail('Project not initialized. Run `gpack init` first.');
-                return;
-            }
+export interface LoadedPoint {
+    point: RestorePoint;
+    manifest: BackupManifest | null;
+}
 
-            const auth = await getAuthenticatedClient();
-            const drive = google.drive({ version: 'v3', auth });
+/**
+ * Archives and blobs that must survive if these restore points are kept.
+ *
+ * An incremental backup carries entries whose bytes live in older archives, so
+ * deleting an old archive can silently break a newer restore point. Keeping a
+ * point therefore pins everything it references.
+ */
+export function collectReferences(kept: LoadedPoint[]): { archives: Set<string>; blobs: Set<string> } {
+    const archives = new Set<string>();
+    const blobs = new Set<string>();
 
-            const folderPath = config.backupFolder || `GPACK/${basename(process.cwd())}`;
-            const folderId = await findDriveFolderId(drive, folderPath);
+    for (const { point, manifest } of kept) {
+        // A point always pins its own archive, including an incremental that
+        // happened to pack nothing.
+        archives.add(point.zip.name);
+        if (!manifest) continue;
 
-            if (!folderId) {
-                spinner.warn('No backups found.');
-                return;
-            }
-
-            const res = await drive.files.list({
-                q: `'${folderId}' in parents and trashed=false`,
-                fields: 'files(id, name, createdTime)',
-                orderBy: 'createdTime desc', // Newest first
-            });
-
-            const files = res.data.files || [];
-            spinner.stop();
-
-            if (files.length === 0) {
-                console.log(picocolors.yellow('No backups to trim.'));
-                return;
-            }
-
-            // If auto flag is provided (note: options.auto might be boolean true if flag present with no value, or string value)
-            // Commander handles optional values: if user says `--auto 10`, it is '10'. If `--auto`, it is true (but default '5' might apply if defined?)
-            // Wait, .option('--auto [keep]', ..., '5') means if user types --auto, it uses '5'? No.
-            // If user types --auto, it gets the value if provided, or logic depends on flag definition.
-            // '[keep]' means optional value.
-            // If user types `gpack trim --auto`, value is true? Actually if optional arg is missing, it might be true.
-            // Let's coerce.
-
-            // Checking how commander handles this:
-            // If flag is `--auto [keep]`, and default is '5'.
-            // `gpack trim` -> auto is undefined (or default '5' ONLY if it was <keep> mandatory arg? No.)
-            // Actually, if I run `gpack trim`, `options.auto` will be the default '5'?
-            // No, default is used if the option is NOT specified?
-            // Wait, usually default value in .option() applies if the flag is NOT provided at all? Or if provided without value?
-
-            // Let's simplify: `gpack trim` (interactive). `gpack trim --auto 5` (keep 5).
-            // .option('--auto <keep>') would make it mandatory if flag is present.
-
-            // Let's handle arguments manually or assume:
-            // If user provided `--auto`, we do auto.
-            // If they provided `--auto 10`, we keep 10.
-
-            const isAuto = options.auto !== undefined && options.auto !== true; // Logic: if --auto is flag, it might be string '5' (default) or value user provided.
-            // Commander 7+ behavior:
-            // .option('--auto [keep]', 'desc', '5')
-            // If I run `gpack trim`, options.auto is '5'.
-            // This is not what I want. I want interactive default.
-
-            // Let's remove default from option definition to distinguish.
-            // .option('--auto <keep>', 'Auto trim keeping N backups')
-
-            // But I want `gpack trim --auto` to default to 5.
-            // .option('--auto [keep]', 'Auto keep N', '5') -> if user runs `gpack trim`, options.auto is '5'. This forces auto always?
-            // Ah, default value applies if option is NOT parsed?
-            // Yes. So current definition makes `options.auto` always '5'.
-
-            // Fix:
-            // .option('--auto [keep]', 'Auto trim')
-            // no default.
-
-        } catch (error: any) {
-            spinner.fail(`Failed: ${error.message}`);
+        for (const entry of Object.values(manifest.entries)) {
+            if (entry.blob) blobs.add(entry.blob);
+            else if (entry.from) archives.add(entry.from);
         }
-    });
+    }
 
+    return { archives, blobs };
+}
 
-// Redefining the command with correct logic
+async function loadPoints(store: BackupStore, points: RestorePoint[]): Promise<LoadedPoint[]> {
+    const loaded: LoadedPoint[] = [];
+    for (const point of points) {
+        const manifest = point.manifestFile ? await readManifest(store, point.manifestFile) : null;
+        loaded.push({ point, manifest });
+    }
+    return loaded;
+}
+
+export interface TrimPlan {
+    kept: LoadedPoint[];
+    removed: LoadedPoint[];
+    /** Selected for removal but retained because a survivor depends on them. */
+    pinned: LoadedPoint[];
+}
+
+/**
+ * Work out what can actually go.
+ *
+ * A surviving incremental holds bytes in older archives, so those archives are
+ * retained together with their manifests. Keeping the manifest matters: an
+ * archive without one would still be listed as a restore point but would only
+ * ever restore the fragment of the tree it happened to pack. Retaining a point
+ * can in turn pin its own dependencies, so the set is expanded to a fixpoint.
+ */
+export function planTrim(all: LoadedPoint[], selectedNames: Set<string>): TrimPlan {
+    const kept = all.filter(p => !selectedNames.has(p.point.zip.name));
+    const pinned: LoadedPoint[] = [];
+
+    for (;;) {
+        const { archives } = collectReferences([...kept, ...pinned]);
+        const newlyPinned = all.filter(p =>
+            selectedNames.has(p.point.zip.name) &&
+            !pinned.includes(p) &&
+            archives.has(p.point.zip.name),
+        );
+        if (newlyPinned.length === 0) break;
+        pinned.push(...newlyPinned);
+    }
+
+    const survivors = new Set([...kept, ...pinned].map(p => p.point.zip.name));
+    const removed = all.filter(p => !survivors.has(p.point.zip.name));
+    return { kept, removed, pinned };
+}
+
+/** Delete the chosen restore points, then everything they alone were holding. */
+async function applyTrim(
+    store: BackupStore,
+    all: LoadedPoint[],
+    selectedNames: Set<string>,
+): Promise<void> {
+    const plan = planTrim(all, selectedNames);
+    const { blobs } = collectReferences([...plan.kept, ...plan.pinned]);
+
+    const spinner = ora('Deleting backups...').start();
+    let freed = 0;
+
+    for (const { point } of plan.removed) {
+        if (point.manifestFile) {
+            await deleteDriveFile(store, point.manifestFile.id);
+        }
+        freed += parseInt(point.zip.size || '0', 10);
+        await deleteDriveFile(store, point.zip.id);
+    }
+
+    spinner.text = 'Collecting unreferenced large files...';
+    const storedBlobs = await listBlobs(store);
+    let blobsDeleted = 0;
+    for (const [blobId, file] of storedBlobs) {
+        if (blobs.has(blobId)) continue;
+        freed += parseInt(file.size || '0', 10);
+        await deleteDriveFile(store, file.id);
+        blobsDeleted++;
+    }
+
+    spinner.succeed(
+        picocolors.green(
+            `Trim complete. Removed ${plan.removed.length} restore point(s), freeing ${formatBytes(freed)}.`,
+        ),
+    );
+    if (blobsDeleted > 0) {
+        console.log(picocolors.gray(`Collected ${blobsDeleted} unreferenced large file(s).`));
+    }
+    if (plan.pinned.length > 0) {
+        console.log(
+            picocolors.yellow(
+                `${plan.pinned.length} older backup(s) were kept because newer ones still depend on their contents.`,
+            ),
+        );
+        plan.pinned.forEach(p => console.log(picocolors.gray(`  ${p.point.zip.name}`)));
+    }
+}
+
 export async function trimAction(options: { auto?: string | boolean } = {}) {
     const spinner = ora('Fetching backups...').start();
     try {
@@ -102,103 +153,109 @@ export async function trimAction(options: { auto?: string | boolean } = {}) {
 
         const auth = await getAuthenticatedClient();
         const drive = google.drive({ version: 'v3', auth });
-        const folderPath = config.backupFolder || `GPACK/${basename(process.cwd())}`;
-        const folderId = await findDriveFolderId(drive, folderPath);
 
-        if (!folderId) {
+        const store = await openStoreForRead(drive, auth, resolveFolderPath(config));
+        if (!store) {
             spinner.warn('No backups found.');
             return;
         }
 
-        const res = await drive.files.list({
-            q: `'${folderId}' in parents and trashed=false`,
-            fields: 'files(id, name, createdTime)',
-            orderBy: 'createdTime desc', // Newest first
-        });
-
-        const files = res.data.files || [];
-        spinner.stop();
-
-        if (files.length === 0) {
+        const points = await listRestorePoints(store);
+        if (points.length === 0) {
+            spinner.stop();
             console.log(picocolors.yellow('No backups to trim.'));
             return;
         }
 
-        // Determine mode
-        let keepCount = 5;
-        let runAuto = false;
+        spinner.text = 'Reading manifests...';
+        const all = await loadPoints(store, points);
+        spinner.stop();
 
-        // if options.auto is present (true or string)
         if (options.auto !== undefined) {
-            runAuto = true;
-            if (typeof options.auto === 'string') {
-                keepCount = parseInt(options.auto, 10);
-            } else if (options.auto === true) {
-                keepCount = 5; // default for flag
-            }
-        }
-
-        if (runAuto) {
-            if (files.length <= keepCount) {
-                console.log(picocolors.green(`Total backups (${files.length}) is within the limit (${keepCount}). No action taken.`));
+            const keepCount = typeof options.auto === 'string' ? parseInt(options.auto, 10) : 5;
+            if (!Number.isFinite(keepCount) || keepCount < 1) {
+                console.log(picocolors.red('--auto needs a positive number of backups to keep.'));
                 return;
             }
-            const toDelete = files.slice(keepCount);
-            console.log(picocolors.cyan(`Auto-trimming: Keeping latest ${keepCount}, deleting ${toDelete.length} old backups...`));
-
-            for (const file of toDelete) {
-                if (file.id) {
-                    await drive.files.delete({ fileId: file.id });
-                    console.log(picocolors.gray(`Deleted ${file.name}`));
-                }
-            }
-            console.log(picocolors.green('Trim complete.'));
-        } else {
-            // Interactive mode
-            console.log(`Found ${files.length} backups.`);
-            const choices = files.map(f => ({
-                name: `${f.name} (${f.createdTime})`,
-                value: f.id,
-                checked: false
-            }));
-
-            const answers = await inquirer.prompt([
-                {
-                    type: 'checkbox',
-                    name: 'filesToDelete',
-                    message: 'Select backups to DELETE (Space to select, Enter to confirm):',
-                    choices: choices,
-                    pageSize: 10
-                }
-            ]);
-
-            if (answers.filesToDelete.length === 0) {
-                console.log('No files deletion selected.');
+            if (all.length <= keepCount) {
+                console.log(
+                    picocolors.green(
+                        `Total backups (${all.length}) is within the limit (${keepCount}). No action taken.`,
+                    ),
+                );
                 return;
             }
-
-            const confirm = await inquirer.prompt([{
-                type: 'confirm',
-                name: 'sure',
-                message: `Are you sure you want to delete ${answers.filesToDelete.length} backups?`,
-                default: false
-            }]);
-
-            if (confirm.sure) {
-                const spinnerDel = ora('Deleting...').start();
-                for (const id of answers.filesToDelete) {
-                    await drive.files.delete({ fileId: id });
-                }
-                spinnerDel.succeed(`Deleted ${answers.filesToDelete.length} backups.`);
-            }
+            const selected = new Set(all.slice(keepCount).map(p => p.point.zip.name));
+            console.log(
+                picocolors.cyan(
+                    `Auto-trimming: keeping the latest ${keepCount}, removing up to ${selected.size} older restore point(s).`,
+                ),
+            );
+            await applyTrim(store, all, selected);
+            return;
         }
+
+        console.log(`Found ${all.length} backups.`);
+        const choices = all.map(({ point, manifest }) => {
+            const size = formatBytes(parseInt(point.zip.size || '0', 10));
+            const kind = manifest ? manifest.type : 'legacy';
+            return {
+                name: `${point.zip.name} (${size}, ${kind}) - ${point.zip.createdTime}`,
+                value: point.zip.name,
+                checked: false,
+            };
+        });
+
+        const answers = await inquirer.prompt([{
+            type: 'checkbox',
+            name: 'namesToDelete',
+            message: 'Select backups to DELETE (Space to select, Enter to confirm):',
+            choices,
+            pageSize: 15,
+        }]);
+
+        if (answers.namesToDelete.length === 0) {
+            console.log('No backups selected.');
+            return;
+        }
+
+        const selected = new Set<string>(answers.namesToDelete);
+        const plan = planTrim(all, selected);
+
+        if (plan.pinned.length > 0) {
+            console.log(
+                picocolors.yellow(
+                    `\n${plan.pinned.length} of the selected backups hold data that newer ones still need, ` +
+                    'so they will be kept:',
+                ),
+            );
+            plan.pinned.forEach(p => console.log(picocolors.gray(`  ${p.point.zip.name}`)));
+        }
+
+        if (plan.removed.length === 0) {
+            console.log(picocolors.yellow('Nothing can be deleted: every selected backup is still depended on.'));
+            return;
+        }
+
+        const confirm = await inquirer.prompt([{
+            type: 'confirm',
+            name: 'sure',
+            message: `Delete ${plan.removed.length} restore point(s)?`,
+            default: false,
+        }]);
+
+        if (!confirm.sure) {
+            console.log('Trim cancelled.');
+            return;
+        }
+
+        await applyTrim(store, all, selected);
 
     } catch (error: any) {
         spinner.fail(`Failed: ${error.message}`);
     }
 }
 
-// Redefining the command with correct logic
 export const trimCommandFixed = new Command('trim')
     .description('Trim old backups')
     .option('--auto [keep]', 'Automatically keep the last N backups (default 5 if value omitted)')

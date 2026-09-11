@@ -1,20 +1,12 @@
 import { Command } from 'commander';
-import { getAuthenticatedClient, findDriveFolderId } from '../lib/drive.js';
-import { loadProjectConfig } from '../lib/config.js';
 import { google } from 'googleapis';
 import picocolors from 'picocolors';
-import { basename } from 'path';
 import ora from 'ora';
-
-// Helper to format bytes (could be moved to a util for strict DRY)
-function formatBytes(bytes: number, decimals = 2) {
-    if (!+bytes) return '0 Bytes';
-    const k = 1024;
-    const dm = decimals < 0 ? 0 : decimals;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
-}
+import { getAuthenticatedClient } from '../lib/drive.js';
+import { loadProjectConfig } from '../lib/config.js';
+import { listBlobs, listRestorePoints, openStoreForRead, readManifest } from '../lib/backupStore.js';
+import { resolveFolderPath } from '../lib/changes.js';
+import { formatBytes } from '../lib/format.js';
 
 export const listCommand = new Command('list')
     .description('List backups and storage usage')
@@ -30,40 +22,72 @@ export const listCommand = new Command('list')
             const auth = await getAuthenticatedClient();
             const drive = google.drive({ version: 'v3', auth });
 
-            const folderPath = config.backupFolder || `GPACK/${basename(process.cwd())}`;
-            const folderId = await findDriveFolderId(drive, folderPath);
-
-            if (!folderId) {
-                spinner.warn('No backups found (Folder not created yet).');
+            const folderPath = resolveFolderPath(config);
+            const store = await openStoreForRead(drive, auth, folderPath);
+            if (!store) {
+                spinner.warn('No backups found (folder not created yet).');
                 return;
             }
 
-            const res = await drive.files.list({
-                q: `'${folderId}' in parents and trashed=false`,
-                fields: 'files(id, name, size, createdTime)',
-                orderBy: 'createdTime desc',
-            });
-
-            const files = res.data.files || [];
-            spinner.stop();
-
-            if (files.length === 0) {
+            const points = await listRestorePoints(store);
+            if (points.length === 0) {
+                spinner.stop();
                 console.log(picocolors.yellow('No backups found.'));
                 return;
             }
 
+            spinner.text = 'Reading manifests...';
+            const rows = [];
+            for (const point of points) {
+                const manifest = point.manifestFile ? await readManifest(store, point.manifestFile) : null;
+                rows.push({ point, manifest });
+            }
+
+            const blobs = await listBlobs(store);
+            spinner.stop();
+
             console.log(picocolors.bold(`Backups for ${folderPath}:`));
-            let totalSize = 0;
-
-            files.forEach(file => {
-                const size = parseInt(file.size || '0');
-                totalSize += size;
-                console.log(`${picocolors.cyan(file.name || 'Unknown')} - ${formatBytes(size)} - ${file.createdTime}`);
-            });
-
             console.log();
-            console.log(picocolors.bold(`Total Storage Used: ${formatBytes(totalSize)}`));
-            console.log(`Total Backups: ${files.length}`);
+
+            let archiveBytes = 0;
+            for (const { point, manifest } of rows) {
+                const size = parseInt(point.zip.size || '0', 10);
+                archiveBytes += size;
+
+                const label = manifest
+                    ? manifest.type === 'full'
+                        ? picocolors.green('full')
+                        : picocolors.cyan(`incr +${manifest.chainIndex}`)
+                    : picocolors.gray('legacy');
+
+                const contents = manifest
+                    ? `${manifest.totals.files} files, ${formatBytes(manifest.totals.bytes)} tracked`
+                    : 'contents unknown';
+
+                console.log(`${picocolors.bold(point.zip.name)}  ${label}`);
+                console.log(
+                    picocolors.gray(`  ${point.zip.createdTime}  archive ${formatBytes(size)}  ${contents}`),
+                );
+            }
+
+            let blobBytes = 0;
+            for (const blob of blobs.values()) {
+                blobBytes += parseInt(blob.size || '0', 10);
+            }
+
+            const newest = rows[0]?.manifest;
+            console.log();
+            console.log(`${picocolors.bold('Restore points:')}   ${rows.length}`);
+            console.log(`${picocolors.bold('Archives:')}         ${formatBytes(archiveBytes)}`);
+            console.log(
+                `${picocolors.bold('Large files:')}      ${formatBytes(blobBytes)} across ${blobs.size} object(s)`,
+            );
+            console.log(`${picocolors.bold('Total on Drive:')}   ${formatBytes(archiveBytes + blobBytes)}`);
+            if (newest) {
+                console.log(
+                    `${picocolors.bold('Latest snapshot:')}  ${formatBytes(newest.totals.bytes)} of project data`,
+                );
+            }
 
         } catch (error: any) {
             spinner.fail(`Failed to list backups: ${error.message}`);

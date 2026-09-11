@@ -1,6 +1,10 @@
 # gpack
 
-gpack is a command-line tool to backup your coding projects to Google Drive by zipping them up.
+gpack is a command-line tool to backup your coding projects to Google Drive.
+
+Backups are incremental. Each push uploads only what changed, and any file above
+25 MB is stored once by content hash and then referenced by every later backup,
+so a large asset is never uploaded twice.
 
 ## Features/Commands
 
@@ -8,10 +12,10 @@ gpack is a command-line tool to backup your coding projects to Google Drive by z
 - `gpack init`: Initialize a project, set storage location, and create `.gpackignore`.
 - `gpack login`: Authenticate with your Google Account. Supports logging into multiple accounts simultaneously and switching or linking them to specific projects.
 - `gpack logout`: Disconnect your account and remove credentials. Supports logging out of a single account or all accounts.
-- `gpack push` (or `gpack backup`): Backup the current project (zip & upload). It checks if changes occurred before creating a new backup unless overridden.
-- `gpack list`: List backups and show storage usage for the current project.
-- `gpack trim`: Reduce backup count (auto-keep last 5, custom N, or interactive deletion).
-- `gpack load` (or `gpack restore`): List and download backups of the project from Google Drive, and restore/extract the files back into the project.
+- `gpack push` (or `gpack backup`): Back up the current project. Uploads only changed files. `--force` backs up even with no changes; `--full` repacks every file instead of writing an incremental.
+- `gpack list`: List restore points and show how much is actually stored on Drive.
+- `gpack trim`: Reduce backup count (auto-keep last N, or interactive deletion). Dependency-aware, so it never deletes data a newer backup still needs.
+- `gpack load` (or `gpack restore`): List and restore backups. `--clean` also deletes local files that are not part of the selected backup.
 
 ## Installation
 
@@ -66,11 +70,49 @@ To avoid your login expiring every 7 days:
 3.  Run `gpack login` to log in to one or more Google Accounts. If multiple accounts are logged in, you can link the project to a specific account.
 4.  Run `gpack` with no arguments to launch the interactive menu, or run `gpack push` to perform a quick backup.
 
+## How Incremental Backups Work
+
+Every push writes two things to Drive: an archive holding the files that
+changed, and a manifest describing the complete project tree at that moment.
+Because the manifest is complete rather than a delta, restoring reads one
+manifest and immediately knows every file and where its bytes live.
+
+Files are handled in two ways depending on size:
+
+- **Under 25 MB**: packed into the push's archive when their contents changed.
+  Unchanged files carry a pointer to the older archive that already holds them.
+- **25 MB and over**: stored as a single object named by its SHA-256 hash. Once
+  a given file's contents are on Drive they are never uploaded again, not even
+  during a full backup. This is what keeps large assets from being re-sent.
+
+Every tenth push writes a full backup, which repacks the small files so chains
+stay short. Large files are still resolved by hash, so a full backup of a
+project dominated by big assets costs almost nothing.
+
+`gpack trim` understands these dependencies. Deleting an old backup keeps its
+archive if a newer backup still points into it, and any stored large file that
+nothing references any more is deleted.
+
+You can tune both thresholds in `.gpack/config.json`:
+
+```json
+{
+  "backupFolder": "GPACK/my-project",
+  "fullEvery": 10,
+  "largeFileThreshold": 26214400
+}
+```
+
 ## Smart Change Checking
 
-To save storage and avoid duplicate backups, `gpack` performs a validation check before zipping and uploading:
-- **For Git Projects**: Checks if any new commits have been made since the last backup date, and checks for uncommitted changes (`git status --porcelain`).
-- **For Non-Git Projects**: Recursively walks the directory (ignoring node_modules, build outputs, and config files) to check if any file's modification time is newer than the last backup.
+Before packing anything, gpack compares the hash of every file against the last
+manifest, so a backup runs only when contents actually differ. Editing a file
+and undoing the edit correctly reports no change.
+
+- **Before the first incremental backup**: there is no manifest to compare
+  against, so gpack falls back to timestamps. For git projects it checks for new
+  commits and uncommitted changes; otherwise it compares file modification times
+  against the last backup.
 - **Bypassing the check**: You can override the change check and force a backup by running:
   ```bash
   gpack push --force
@@ -86,7 +128,21 @@ To restore a backup, run:
 gpack load
 # or select "Load / Restore a Backup" in the interactive menu
 ```
-This lists your backups on Google Drive, downloads your selected zip file to a temporary location, extracts it using the native system `tar` command (preserving your file structure), and cleans up.
+This lists your restore points, downloads only the archives and large files the
+selected point actually needs, rebuilds that exact tree in a temporary staging
+directory, and then copies it into your project.
+
+By default existing files are overwritten and unrelated local files are left
+alone. To make the project match the backup exactly, deleting local files the
+backup does not contain, run:
+
+```bash
+gpack load --clean
+```
+
+Backups made before incremental support have no manifest. They still restore,
+by extracting the whole archive over the current directory, and are marked
+`legacy` in listings.
 
 ## Backup Naming
 
@@ -99,4 +155,24 @@ For example: `gpack_2024-01-30T14-55-00-123Z.zip`
 ## Configuration
 
 - Project config is stored in `.gpack/config.json`.
-- Ignore rules are in `.gpackignore` (syntax similar to .gitignore). Default ignores: `node_modules`, `.git`, `.gpack`, `dist`, `coverage`, `.env`.
+- A local hash cache lives in `.gpack/state.json`. It only makes scans faster;
+  deleting it costs one re-hash pass and nothing else.
+- Ignore rules are in `.gpackignore` (gitignore syntax). Default ignores:
+  `node_modules`, `.git`, `.gpack`, `.claude`, `dist`, `coverage`, `.env`.
+
+`.claude` is excluded because Claude Code keeps git worktrees under it. Each one
+is a full second copy of your project, so without the rule every backup stores
+your source twice and churns whenever a worktree is created or removed.
+
+A bare directory name such as `node_modules` now excludes the whole directory.
+Earlier versions matched only the top-level entry, so the contents were archived
+anyway; if your existing backups look far larger than your project, that is why.
+
+### Layout on Google Drive
+
+```
+GPACK/<project>/
+  <project>_<timestamp>.zip   a restore point's archive
+  _gpack_meta/                one manifest per restore point
+  _gpack_blobs/               large files, stored once and named by hash
+```
